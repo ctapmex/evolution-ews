@@ -3899,20 +3899,22 @@ e_ews_process_find_folder_items_response (EEwsConnection *cnc,
 }
 
 gboolean
-e_ews_connection_find_folder_items_sync (EEwsConnection *cnc,
-                                         gint pri,
-                                         EwsFolderId *fid,
-                                         const gchar *default_props,
-                                         const EEwsAdditionalProps *add_props,
-                                         EwsSortOrder *sort_order,
-                                         const gchar *query,
-					 GPtrArray *only_ids, /* element-type utf8 */
-                                         EEwsFolderType type,
-                                         gboolean *out_includes_last_item,
-                                         GSList **out_items,
-                                         EwsConvertQueryCallback convert_query_cb,
-                                         GCancellable *cancellable,
-                                         GError **error)
+e_ews_connection_find_folder_items_indexed_sync (EEwsConnection *cnc,
+						 gint pri,
+						 EwsFolderId *fid,
+						 const gchar *default_props,
+						 const EEwsAdditionalProps *add_props,
+						 EwsSortOrder *sort_order,
+						 const gchar *query,
+						 GPtrArray *only_ids, /* element-type utf8 */
+						 EEwsFolderType type,
+						 guint indexed_page_size,
+						 guint indexed_offset,
+						 gboolean *out_includes_last_item,
+						 GSList **out_items,
+						 EwsConvertQueryCallback convert_query_cb,
+						 GCancellable *cancellable,
+						 GError **error)
 {
 	ESoapRequest *request;
 	ESoapResponse *response;
@@ -3943,6 +3945,23 @@ e_ews_connection_find_folder_items_sync (EEwsConnection *cnc,
 	ews_append_additional_props_to_msg (request, add_props);
 
 	e_soap_request_end_element (request);
+
+	if (indexed_page_size > 0) {
+		gchar *max_entries;
+		gchar *offset_text;
+
+		max_entries = g_strdup_printf ("%u", indexed_page_size);
+		offset_text = g_strdup_printf ("%u", indexed_offset);
+
+		e_soap_request_start_element (request, "IndexedPageItemView", "messages", NULL);
+		e_soap_request_add_attribute (request, "MaxEntriesReturned", max_entries, NULL, NULL);
+		e_soap_request_add_attribute (request, "Offset", offset_text, NULL, NULL);
+		e_soap_request_add_attribute (request, "BasePoint", "Beginning", NULL, NULL);
+		e_soap_request_end_element (request);
+
+		g_free (max_entries);
+		g_free (offset_text);
+	}
 
 	/*write restriction message based on query*/
 	if (convert_query_cb) {
@@ -4001,6 +4020,27 @@ e_ews_connection_find_folder_items_sync (EEwsConnection *cnc,
 	}
 
 	return success;
+}
+
+gboolean
+e_ews_connection_find_folder_items_sync (EEwsConnection *cnc,
+                                         gint pri,
+                                         EwsFolderId *fid,
+                                         const gchar *default_props,
+                                         const EEwsAdditionalProps *add_props,
+                                         EwsSortOrder *sort_order,
+                                         const gchar *query,
+					 GPtrArray *only_ids, /* element-type utf8 */
+                                         EEwsFolderType type,
+                                         gboolean *out_includes_last_item,
+                                         GSList **out_items,
+                                         EwsConvertQueryCallback convert_query_cb,
+                                         GCancellable *cancellable,
+                                         GError **error)
+{
+	return e_ews_connection_find_folder_items_indexed_sync (cnc, pri, fid, default_props, add_props,
+		sort_order, query, only_ids, type, 0, 0, out_includes_last_item, out_items,
+		convert_query_cb, cancellable, error);
 }
 
 static gboolean

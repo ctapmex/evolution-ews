@@ -536,6 +536,23 @@ gboolean	e_ews_connection_find_folder_items_sync
 						 EwsConvertQueryCallback convert_query_cb,
 						 GCancellable *cancellable,
 						 GError **error);
+gboolean	e_ews_connection_find_folder_items_indexed_sync
+						(EEwsConnection *cnc,
+						 gint pri,
+						 EwsFolderId *fid,
+						 const gchar *default_props,
+						 const EEwsAdditionalProps *add_props,
+						 EwsSortOrder *sort_order,
+						 const gchar *query,
+						 GPtrArray *only_ids, /* element-type utf8 */
+						 EEwsFolderType type,
+						 guint indexed_page_size,
+						 guint indexed_offset,
+						 gboolean *out_includes_last_item,
+						 GSList **out_items, /* EEwsItem * */
+						 EwsConvertQueryCallback convert_query_cb,
+						 GCancellable *cancellable,
+						 GError **error);
 gboolean	e_ews_connection_get_items_sync	(EEwsConnection *cnc,
 						 gint pri,
 						 const GSList *ids, /* gchar * */
