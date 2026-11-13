@@ -59,6 +59,7 @@ which needs to be better organized via functions */
  * broken IncludesLastItemInRange cannot loop forever. */
 #define EWS_BODY_SEARCH_PAGE_SIZE 500
 #define EWS_BODY_SEARCH_MAX_MATCHES 5000
+#define EWS_BODY_SEARCH_FETCH_SIZE 100
 /* Reuse a result only for the rest of the same search, not a later one. */
 #define EWS_BODY_SEARCH_CACHE_USEC (5 * G_USEC_PER_SEC)
 
@@ -3263,7 +3264,6 @@ static gboolean
 ews_find_body_items (EEwsConnection *cnc,
 		     EwsFolderId *fid,
 		     const gchar *expression,
-		     const EEwsAdditionalProps *add_props,
 		     GSList **out_items,
 		     GCancellable *cancellable,
 		     GError **error)
@@ -3286,7 +3286,7 @@ ews_find_body_items (EEwsConnection *cnc,
 
 		success = e_ews_connection_find_folder_items_indexed_sync (
 			cnc, EWS_PRIORITY_MEDIUM,
-			fid, "IdOnly", add_props, NULL, expression, NULL,
+			fid, "IdOnly", NULL, NULL, expression, NULL,
 			E_EWS_FOLDER_TYPE_MAILBOX, page_size, offset,
 			&includes_last_item, &page_items,
 			e_ews_query_to_restriction,
@@ -3324,37 +3324,99 @@ ews_find_body_items (EEwsConnection *cnc,
 	return success;
 }
 
-/* Adds FindItem hits that are missing from the local summary. Does not mark
- * them recent and clears the folder-flagged bit so the client will not upload
- * flags for a message that already exists on the server. */
-static GPtrArray *
-ews_merge_body_search_hits (CamelEwsFolder *ews_folder,
+static gboolean
+ews_body_search_is_message_type (EEwsItemType item_type)
+{
+	return item_type == E_EWS_ITEM_TYPE_MESSAGE ||
+		item_type == E_EWS_ITEM_TYPE_MEETING_REQUEST ||
+		item_type == E_EWS_ITEM_TYPE_MEETING_MESSAGE ||
+		item_type == E_EWS_ITEM_TYPE_MEETING_RESPONSE ||
+		item_type == E_EWS_ITEM_TYPE_MEETING_CANCELLATION;
+}
+
+static gboolean
+ews_add_body_search_infos (CamelEwsFolder *ews_folder,
+			   CamelFolderSummary *summary,
+			   EEwsConnection *cnc,
+			   const GSList *ids, /* gchar * */
+			   gboolean *inout_added,
+			   GCancellable *cancellable,
+			   GError **error)
+{
+	EEwsAdditionalProps *add_props;
+	GSList *items = NULL;
+	const GSList *link;
+	gboolean success;
+
+	add_props = e_ews_additional_props_new ();
+	add_props->field_uri = g_strdup (e_ews_connection_satisfies_server_version (cnc, E_EWS_EXCHANGE_2013) ?
+		SUMMARY_MESSAGE_PROPS_2013 : SUMMARY_MESSAGE_PROPS);
+	add_props->extended_furis = ews_folder_get_summary_message_mapi_flags ();
+
+	success = e_ews_connection_get_items_sync (
+		cnc, EWS_PRIORITY_MEDIUM,
+		ids, "IdOnly", add_props,
+		FALSE, NULL, E_EWS_BODY_TYPE_ANY, &items, NULL, NULL,
+		cancellable, error);
+
+	e_ews_additional_props_free (add_props);
+
+	for (link = items; success && link; link = g_slist_next (link)) {
+		EEwsItem *item = link->data;
+		CamelMessageInfo *mi;
+
+		if (!item || e_ews_item_get_item_type (item) == E_EWS_ITEM_TYPE_ERROR)
+			continue;
+
+		mi = camel_ews_utils_item_to_message_info (ews_folder, cnc, item, cancellable);
+		if (!mi)
+			continue;
+
+		/* Keep the EWS ItemId. summary_add() marks the info for upload;
+		 * clear that before anything can announce a local edit. */
+		camel_message_info_set_abort_notifications (mi, TRUE);
+		camel_folder_summary_add (summary, mi, TRUE);
+		camel_message_info_set_folder_flagged (mi, FALSE);
+		camel_message_info_set_abort_notifications (mi, FALSE);
+		camel_message_info_set_dirty (mi, TRUE);
+
+		g_object_unref (mi);
+		*inout_added = TRUE;
+	}
+
+	g_slist_free_full (items, g_object_unref);
+
+	return success;
+}
+
+/* FindItem cannot return recipients or categories, so it gives only ItemIds.
+ * Hits missing from the local summary are fetched with GetItem and added
+ * without marking them recent or flagged for upload. @out_uids receives the
+ * whole server list even when storing the missing hits fails. */
+static gboolean
+ews_store_body_search_hits (CamelEwsFolder *ews_folder,
 			    EEwsConnection *cnc,
 			    GSList *items,
-			    gboolean *out_save_failed,
+			    GPtrArray **out_uids,
 			    GCancellable *cancellable,
 			    GError **error)
 {
 	CamelFolderSummary *summary;
 	GPtrArray *uids;
+	GSList *missing = NULL, *batch = NULL;
+	guint batch_len = 0;
 	gboolean added = FALSE;
+	gboolean success = TRUE;
 	const GSList *link;
 
-	*out_save_failed = FALSE;
+	uids = g_ptr_array_new_with_free_func ((GDestroyNotify) camel_pstring_free);
+	*out_uids = uids;
 
 	summary = camel_folder_get_folder_summary (CAMEL_FOLDER (ews_folder));
-	if (!summary) {
-		g_set_error_literal (error, CAMEL_ERROR, CAMEL_ERROR_GENERIC,
-			_("Cannot store body search hits: folder summary is missing"));
-		return NULL;
-	}
-
-	uids = g_ptr_array_new_with_free_func ((GDestroyNotify) camel_pstring_free);
 
 	for (link = items; link; link = g_slist_next (link)) {
 		EEwsItem *item = link->data;
 		const EwsId *id;
-		CamelMessageInfo *mi;
 
 		if (!item || e_ews_item_get_item_type (item) == E_EWS_ITEM_TYPE_ERROR)
 			continue;
@@ -3363,53 +3425,63 @@ ews_merge_body_search_hits (CamelEwsFolder *ews_folder,
 		if (!id || !id->id)
 			continue;
 
-		if (!camel_folder_summary_check_uid (summary, id->id)) {
-			mi = camel_ews_utils_item_to_message_info (ews_folder, cnc, item, cancellable);
-			if (!mi)
-				continue;
-
-			/* Keep the EWS ItemId. summary_add() marks the info for upload;
-			 * clear that before anything can announce a local edit. */
-			camel_message_info_set_abort_notifications (mi, TRUE);
-			camel_folder_summary_add (summary, mi, TRUE);
-			camel_message_info_set_folder_flagged (mi, FALSE);
-			camel_message_info_set_abort_notifications (mi, FALSE);
-			camel_message_info_set_dirty (mi, TRUE);
-
-			g_object_unref (mi);
-			added = TRUE;
-		}
-
 		g_ptr_array_add (uids, (gpointer) camel_pstring_strdup (id->id));
+
+		if (summary && !camel_folder_summary_check_uid (summary, id->id) &&
+		    ews_body_search_is_message_type (e_ews_item_get_item_type (item)))
+			missing = g_slist_prepend (missing, id->id);
 	}
 
-	if (added && !camel_folder_summary_save (summary, error)) {
-		*out_save_failed = TRUE;
-		return uids;
+	if (!summary) {
+		g_set_error_literal (error, CAMEL_ERROR, CAMEL_ERROR_GENERIC,
+			_("Cannot store body search hits: folder summary is missing"));
+		return FALSE;
 	}
 
-	return uids;
+	missing = g_slist_reverse (missing);
+
+	for (link = missing; success && link; link = g_slist_next (link)) {
+		batch = g_slist_prepend (batch, link->data);
+		batch_len++;
+
+		if (batch_len == EWS_BODY_SEARCH_FETCH_SIZE || !link->next) {
+			batch = g_slist_reverse (batch);
+			success = ews_add_body_search_infos (ews_folder, summary, cnc, batch, &added, cancellable, error);
+			g_slist_free (batch);
+			batch = NULL;
+			batch_len = 0;
+		}
+	}
+
+	g_slist_free (missing);
+
+	if (added && !camel_folder_summary_save (summary, success ? error : NULL))
+		success = FALSE;
+
+	return success;
 }
 
+/* With @for_prepare the result has to be complete: every hit must be in the
+ * local summary, because the caller trusts the list without downloading the
+ * bodies. Otherwise the server list is only a filter for known messages. */
 static gboolean
 ews_run_body_search (CamelEwsFolder *ews_folder,
 		     GPtrArray *words,
-		     gboolean allow_cache,
+		     gboolean for_prepare,
 		     GPtrArray **out_uids,
 		     GCancellable *cancellable,
 		     GError **error)
 {
 	CamelEwsStore *ews_store;
 	EEwsConnection *cnc = NULL;
-	EEwsAdditionalProps *add_props = NULL;
 	EwsFolderId *fid = NULL;
 	GSList *items = NULL;
 	GPtrArray *uids = NULL;
+	GError *local_error = NULL;
 	gchar *folder_id = NULL;
 	gchar *expression = NULL;
-	gboolean save_failed = FALSE;
-	gboolean success = FALSE;
-	gboolean cancelled;
+	gboolean complete = FALSE;
+	gboolean success;
 
 	g_return_val_if_fail (out_uids != NULL, FALSE);
 
@@ -3420,7 +3492,7 @@ ews_run_body_search (CamelEwsFolder *ews_folder,
 		return TRUE;
 	}
 
-	if (allow_cache) {
+	if (!for_prepare) {
 		gboolean cached_success = FALSE;
 		GPtrArray *cached_uids = NULL;
 
@@ -3460,38 +3532,34 @@ ews_run_body_search (CamelEwsFolder *ews_folder,
 	fid = e_ews_folder_id_new (folder_id, NULL, FALSE);
 	expression = ews_body_search_expression (words);
 
-	add_props = e_ews_additional_props_new ();
-	add_props->field_uri = g_strdup (e_ews_connection_satisfies_server_version (cnc, E_EWS_EXCHANGE_2013) ?
-		SUMMARY_MESSAGE_PROPS_2013 : SUMMARY_MESSAGE_PROPS);
-	add_props->extended_furis = ews_folder_get_summary_message_mapi_flags ();
-
-	if (!ews_find_body_items (cnc, fid, expression, add_props, &items, cancellable, error)) {
+	if (!ews_find_body_items (cnc, fid, expression, &items, cancellable, error)) {
 		camel_ews_store_maybe_disconnect (ews_store, error ? *error : NULL);
 		goto store_cache;
 	}
 
-	uids = ews_merge_body_search_hits (ews_folder, cnc, items, &save_failed, cancellable, error);
-	if (!uids)
-		goto store_cache;
+	complete = ews_store_body_search_hits (ews_folder, cnc, items, &uids, cancellable, &local_error);
+	if (!complete) {
+		camel_ews_store_maybe_disconnect (ews_store, local_error);
 
-	success = !save_failed;
-
- store_cache:
-	cancelled = g_cancellable_is_cancelled (cancellable);
-	if (!cancelled) {
-		/* A failed save still keeps the server UID list, so the following
-		 * search_body_sync in the same search does not call FindItem again.
-		 * prepare_remote_body_search_sync returns failure in that case and
-		 * the list is not treated as authoritative. */
-		ews_body_search_cache_store (ews_folder, words, uids != NULL, uids);
+		if (for_prepare)
+			g_propagate_error (error, g_steal_pointer (&local_error));
+		else
+			g_clear_error (&local_error);
 	}
 
+ store_cache:
+	/* The server list stays usable as a filter for known messages even when
+	 * storing the missing hits failed, so the following search_body_sync in
+	 * the same search does not call FindItem again. */
+	if (!g_cancellable_is_cancelled (cancellable))
+		ews_body_search_cache_store (ews_folder, words, uids != NULL, uids);
+
+	success = uids && (complete || !for_prepare);
 	if (success)
 		*out_uids = g_steal_pointer (&uids);
 
 	g_clear_pointer (&uids, g_ptr_array_unref);
 	g_slist_free_full (items, g_object_unref);
-	e_ews_additional_props_free (add_props);
 	g_clear_object (&cnc);
 	e_ews_folder_id_free (fid);
 	g_free (folder_id);
@@ -3510,7 +3578,7 @@ ews_search_body_sync (CamelFolder *folder,
 	g_return_val_if_fail (CAMEL_IS_EWS_FOLDER (folder), FALSE);
 	g_return_val_if_fail (out_uids != NULL, FALSE);
 
-	return ews_run_body_search (CAMEL_EWS_FOLDER (folder), words, TRUE, out_uids, cancellable, error);
+	return ews_run_body_search (CAMEL_EWS_FOLDER (folder), words, FALSE, out_uids, cancellable, error);
 }
 
 static GPtrArray *
@@ -3524,7 +3592,7 @@ ews_prepare_remote_body_search_sync (CamelFolder *folder,
 	g_return_val_if_fail (CAMEL_IS_EWS_FOLDER (folder), NULL);
 	g_return_val_if_fail (words != NULL, NULL);
 
-	if (!ews_run_body_search (CAMEL_EWS_FOLDER (folder), words, FALSE, &uids, cancellable, error)) {
+	if (!ews_run_body_search (CAMEL_EWS_FOLDER (folder), words, TRUE, &uids, cancellable, error)) {
 		g_clear_pointer (&uids, g_ptr_array_unref);
 		return NULL;
 	}
